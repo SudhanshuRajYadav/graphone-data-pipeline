@@ -1,0 +1,109 @@
+GraphOne Intelligence Graph — Architecture & Production Design
+
+1. SCALE STRATEGY (500,000+ records)
+
+Current implementation demonstrates the pattern at ~1000-1200 records per vertical
+using a single-machine async pipeline (aiohttp/asyncio with bounded semaphores).
+Scaling to 500k+ requires no code changes — only infrastructure:
+
+- Horizontal worker scaling: Deploy the same collector functions as containerized
+  workers behind a task queue (Celery + Redis, or AWS SQS). Each worker pulls a
+  batch of source URLs/IDs and processes independently.
+- Partitioned crawling: Split large directories (e.g. arXiv categories, Product Hunt
+  date ranges) into non-overlapping shards, one per worker, to avoid duplicate work
+  without coordination overhead.
+- Rate-limit-aware worker pools: Each external API (GitHub, arXiv, LLM providers) gets
+  its own worker pool sized to that API's documented rate limit, so one slow/limited
+  API never blocks throughput on others.
+- Orchestration: Airflow or Prefect DAGs to schedule, retry, and monitor each vertical's
+  pipeline independently, with dead-letter queues for permanently failed records.
+
+2. HANDLING 413s AND 429s
+
+413 (Payload Too Large):
+- All LLM prompts are built via batch-and-truncate: each item's text is capped to a
+  fixed character budget (e.g. tagline: 80 chars, description: 100 chars) before
+  being joined into a batch prompt. This keeps prompts well under context limits
+  regardless of source text length, prioritizing the most information-dense fields
+  (title/tagline) over full body text.
+- Batch size is tuned per-provider based on that provider's token-per-minute budget,
+  not just item count — larger batches for cheap/high-quota providers, smaller for
+  constrained free tiers.
+
+429 (Rate Limited):
+- Multi-tier fallback chain: each extraction call tries providers in priority order
+  (e.g. Groq → Gemini). Within a provider, failures trigger exponential backoff with
+  random jitter (6-9s in this implementation) before retrying, up to a max retry
+  count, before falling through to the next provider.
+- This was validated under real conditions during development: the pipeline
+  encountered daily token quota exhaustion (Groq: 200k TPD), request-per-day limits
+  (Gemini free tier: 20/day), and upstream shared-pool congestion (OpenRouter free
+  tier) — in each case the fallback chain degraded gracefully rather than crashing,
+  logging the failure and either switching providers or applying a safe default
+  value, never fabricating a result.
+- In production with paid tiers, the same chain would rarely need its lower tiers,
+  but the resilience pattern remains valuable for provider outages.
+
+3. FRESHNESS TRACKING (no duplicate processing across distributed nodes)
+
+- Deduplication key: each record is keyed by its canonical source_url (or a content
+  hash for sources without stable URLs). A shared datastore (Redis set, or a Postgres
+  table with a UNIQUE constraint on source_url) is checked before processing and
+  updated after.
+- Idempotent writes: using `INSERT ... ON CONFLICT (source_url) DO NOTHING` (Postgres)
+  means even if two distributed workers race on the same URL, only one write succeeds
+  — no application-level locking needed.
+- Freshness filtering happens at ingestion time using each source's own structured
+  timestamp (RSS pubDate, API created_at/date fields) rather than scrape-time
+  heuristics wherever a reliable timestamp is available, minimizing false positives/
+  negatives on the 24-hour freshness requirement.
+- For sources without structured dates, a last-seen watermark per source (stored
+  alongside the dedup table) lets a worker skip content already seen in a prior run,
+  even without an explicit publish date.
+
+4. STORAGE STRATEGY
+
+Primary database: PostgreSQL
+- JSONB columns for the `content` field per entity accommodate schema variation
+  across verticals (Startup/Product/Paper/Job/News) while keeping shared fields
+  (schemaVersion, recordType, source, collectedAt) as typed columns for fast
+  filtering/indexing.
+- Native UNIQUE constraints + ON CONFLICT support directly enable the dedup strategy
+  above without extra infrastructure.
+- Mature ecosystem for analytics (window functions, materialized views) for
+  downstream reporting.
+
+Graph layer: Neo4j
+- The "Intelligence Graph" positioning implies relationship-heavy queries (e.g.
+  "which startups' founders previously worked at X", "which papers cite work from
+  startup Y's research team") that are naturally expressed as graph traversals
+  rather than SQL joins across many tables.
+- Postgres remains the system of record; Neo4j is populated via CDC (change data
+  capture) or scheduled sync, keeping a single source of truth while enabling
+  graph-native queries for the product surface.
+
+Vector store: pgvector (Postgres extension) for MVP, migrating to a dedicated
+vector DB (Pinecone/Weaviate) at scale
+- Enables semantic search over paper abstracts and news content (e.g. "find papers
+  similar to this one") without a separate service for early-stage scale; a
+  dedicated vector DB becomes worthwhile once embedding volume and query load
+  justify the operational overhead.
+
+5. ANTI-BOT / SCALE THINKING (Phase V)
+
+For this trial, YC's company directory was found to disallow automated access via
+robots.txt. Rather than circumvent that restriction, the pipeline was redesigned to
+use Product Hunt's official, ToS-compliant API as the source for both Startups and
+Products — trading some data completeness (e.g. no employeeCount) for guaranteed
+compliance and reliability.
+
+For genuinely Cloudflare/Datadome-protected high-value sources where no official API
+exists, the recommended production approach is:
+- Headless browser automation (Playwright) with realistic request pacing, rotating
+  user-agents, and session persistence to reduce fingerprinting signals
+  distinguishing bot traffic from a real user session
+- Preferring official/partner APIs wherever they exist, even at higher integration
+  cost, since they offer stability and compliance that scraping cannot guarantee
+- Residential proxy rotation for cases where an API genuinely does not exist and the
+  data is business-critical, with strict rate limiting to avoid triggering defensive
+  measures
